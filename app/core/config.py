@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     top_k: int = 6
     max_upload_mb: int = 15
     nvd_api_key: str | None = None
+    # Comma-separated list of allowed CORS origins.
+    # In production set this to your exact frontend URL only, e.g.:
+    #   CORS_ORIGINS=https://your-frontend.pages.dev
+    # In local dev the default covers common Next.js / Vite ports.
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
     enable_startup_ingestion: bool = True
     embedding_batch_size: int = 20
