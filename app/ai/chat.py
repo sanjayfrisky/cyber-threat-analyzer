@@ -1,7 +1,5 @@
-import asyncio
 import json
 import logging
-import random
 from collections.abc import AsyncIterator
 from sqlalchemy.orm import Session
 
@@ -15,44 +13,12 @@ from app.db.database import SessionLocal, ChatMessage
 
 logger = logging.getLogger(__name__)
 
+
 class ChatService:
     def __init__(self, rag: RAGPipeline | None = None, llm_engine: LLMs | None = None):
         self.rag = rag or RAGPipeline()
         self.llm = llm_engine or llm
         self.fallback_manager = LLMFallbackManager(self.llm)
-
-    @staticmethod
-    async def retry_with_jitter(
-        func,
-        *args,
-        max_retries: int = 3,
-        base_delay: float = 1.0,
-        max_delay: float = 8.0,
-        **kwargs
-    ):
-        """
-        Executes an async callable with Exponential Backoff and Full Jitter.
-        Formula:
-            backoff = min(max_delay, base_delay * (2 ** (attempt - 1)))
-            sleep_time = random.uniform(0, backoff)
-        """
-        for attempt in range(1, max_retries + 1):
-            try:
-                res = func(*args, **kwargs)
-                if asyncio.iscoroutine(res):
-                    return await res
-                return res
-            except Exception as error:
-                if attempt >= max_retries:
-                    logger.warning("Attempt %d/%d failed: %s", attempt, max_retries, error)
-                    raise
-                backoff = min(max_delay, base_delay * (2 ** (attempt - 1)))
-                sleep_time = random.uniform(0, backoff)
-                logger.info(
-                    "Attempt %d/%d failed: %s — retrying in %.2fs",
-                    attempt, max_retries, error, sleep_time
-                )
-                await asyncio.sleep(sleep_time)
 
     async def chat(self, user_prompt: str) -> AsyncIterator[str]:
         """Retrieve evidence once, then generate using ordered LLM failover."""
@@ -60,10 +26,9 @@ class ChatService:
         try:
             results = self.rag.retrieve(db, user_prompt, settings.top_k)
             grounded_prompt = (
-                f"USER QUESTION:\\n{user_prompt}\\n\\n"
-                f"RETRIEVED EVIDENCE:\\n{build_context(results)}"
+                f"USER QUESTION:\n{user_prompt}\n\n"
+                f"RETRIEVED EVIDENCE:\n{build_context(results)}"
             )
-
             try:
                 result = await self.fallback_manager.generate(grounded_prompt)
                 yield result["answer"]
@@ -76,14 +41,19 @@ class ChatService:
     async def stream_answer(
         self, prompt: str, session_id: str = "default-session"
     ) -> AsyncIterator[str]:
-        """SSE chat endpoint with safe provider failover.
+        """True token-level SSE streaming with per-provider retry + fallback.
 
-        Retrieval runs once. A provider's complete answer is buffered before
-        the first answer chunk is emitted, preventing mixed partial answers
-        when a provider fails mid-generation.
+        Flow:
+          1. Retrieve RAG evidence once.
+          2. Emit a ``sources`` event immediately so the UI can render citations.
+          3. Stream tokens directly from the LLM as they arrive — no buffering.
+             Retry logic and provider failover live in LLMFallbackManager.
+          4. After the stream ends, persist the conversation to the DB.
+          5. Emit a ``done`` event with the session id and provider used.
         """
         db = SessionLocal()
         try:
+            # --- 1. RAG retrieval ---
             results = self.rag.retrieve(db, prompt, settings.top_k)
             sources = [
                 {
@@ -96,46 +66,50 @@ class ChatService:
                 for i, item in enumerate(results, 1)
             ]
 
+            # --- 2. Emit sources event ---
             yield (
-                f"data: {json.dumps({'type': 'sources', 'sources': sources, 'retrieved_count': len(results)})}\\n\\n"
+                f"data: {json.dumps({'type': 'sources', 'sources': sources, 'retrieved_count': len(results)})}\n\n"
             )
 
-            provider_name = "none"
             grounded_prompt = (
-                f"USER QUESTION:\\n{prompt}\\n\\n"
-                f"RETRIEVED EVIDENCE:\\n{build_context(results)}"
+                f"USER QUESTION:\n{prompt}\n\n"
+                f"RETRIEVED EVIDENCE:\n{build_context(results)}"
             )
+
+            # --- 3. Stream tokens live ---
+            collected: list[str] = []
+            provider_name = "none"
             try:
-                generated = await self.fallback_manager.generate(grounded_prompt)
-                complete_answer = generated["answer"]
-                provider_name = generated["provider"]
+                async for token, prov in self.fallback_manager.stream_generate(grounded_prompt):
+                    provider_name = prov
+                    collected.append(token)
+                    yield f"data: {json.dumps({'type': 'chunk', 'text': token})}\n\n"
+
             except AllProvidersFailed:
                 logger.exception("Every configured LLM provider failed.")
-                complete_answer = fallback_answer(
+                error_msg = fallback_answer(
                     "All configured threat-intelligence LLM providers failed."
                 )
+                yield f"data: {json.dumps({'type': 'chunk', 'text': error_msg})}\n\n"
+                collected.append(error_msg)
 
-            # Emit only after a provider has completed successfully.
-            chunk_size = 700
-            for offset in range(0, len(complete_answer), chunk_size):
-                piece = complete_answer[offset:offset + chunk_size]
-                yield f"data: {json.dumps({'type': 'chunk', 'text': piece})}\\n\\n"
-
+            # --- 4. Persist to DB ---
+            complete_answer = "".join(collected)
             db.add_all([
                 ChatMessage(session_id=session_id, role="user", content=prompt),
                 ChatMessage(session_id=session_id, role="assistant", content=complete_answer),
             ])
             db.commit()
 
+            # --- 5. Done event ---
             yield (
-                f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'provider': provider_name})}\\n\\n"
+                f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'provider': provider_name})}\n\n"
             )
 
-        except Exception as exc:
+        except Exception:
             db.rollback()
             logger.exception("Chat streaming request failed.")
-            # Do not expose internal exception strings, credentials, or DB details.
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'Chat request could not be completed.'})}\\n\\n"
+            yield f"data: {json.dumps({'type': 'error', 'detail': 'Chat request could not be completed.'})}\n\n"
         finally:
             db.close()
 
