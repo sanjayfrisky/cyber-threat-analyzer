@@ -45,14 +45,15 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("CORS allowed origins: %s", allowed)
 
-    if settings.enable_startup_ingestion:
-        try:
-            init_db()
-        except Exception as exc:
-            logger.warning("Database initialization skipped or failed: %s", exc)
+    # Always initialize DB schema on startup
+    try:
+        init_db()
+    except Exception as exc:
+        logger.warning("Database initialization skipped or failed: %s", exc)
 
-        # Uncomment to enable background ingestion on startup:
-        # asyncio.create_task(run_startup_ingestion())
+    if settings.enable_startup_ingestion:
+        import asyncio
+        asyncio.create_task(run_startup_ingestion())
     yield
 
 
