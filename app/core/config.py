@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     database_url: str
     gemini_api_key: str
-    gemini_chat_model: str = "gemini-2.5-flash"
+    gemini_chat_model: str = "gemini-2.0-flash"
     gemini_embedding_model: str = "gemini-embedding-001"
     embedding_dimension: int = 768
     top_k: int = 6
@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     groq_model: str = "openai/gpt-oss-20b"
     mistral_model: str = "mistral-small-latest"
     nvidia_model: str = "meta/llama-3.1-8b-instruct"
+
+    # LLM generation settings (used by model_factory and agent layer)
+    llm_temperature: float = 0.2
+    llm_max_tokens: int = 4096
+    llm_timeout_seconds: int = 30
+
+    # Agent safety limits
+    agent_max_iterations: int = 10
+    agent_max_tool_calls: int = 15
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

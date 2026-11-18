@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.db.database import init_db, SessionLocal
 from app.routes.chat import router
 from app.routes.screening import router as screening_router
+from app.routes.agent import router as agent_router
 from app.ai.rag.ingestion import scrape_and_ingest_all
 
 logger = logging.getLogger(__name__)
@@ -83,3 +84,4 @@ app.add_middleware(
 
 app.include_router(router, prefix="/api")
 app.include_router(screening_router, prefix="/api")
+app.include_router(agent_router, prefix="/api")

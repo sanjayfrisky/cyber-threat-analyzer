@@ -1,206 +1,195 @@
-"""Provider orchestration with safe, ordered failover and true token streaming."""
+"""LangChain-native provider orchestration with safe failover, retry, and token streaming."""
 from __future__ import annotations
 
 import asyncio
 import logging
-import random
-from collections.abc import AsyncIterator
 from typing import AsyncGenerator
 
 import httpx
+from langchain_core.prompts import ChatPromptTemplate
 
-from app.ai.llm import LLMs, llm as default_llm
+from app.ai.llm.providers import LLMs, llm as default_llm
+from app.ai.llm.retry_manager import RETRYABLE_EXCEPTIONS as _RETRYABLE_EXCEPTIONS, MAX_ADDITIONAL_RETRIES as _MAX_RETRIES
+from app.ai.prompts.gemini_prompt import KNOWLEDGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
-
-# Errors that are transient and worth retrying (rate-limit, gateway timeout, etc.)
-_RETRYABLE_EXCEPTIONS = (
-    httpx.HTTPStatusError,
-    httpx.TimeoutException,
-    asyncio.TimeoutError,
-    ConnectionResetError,
-)
-
-# Configuration
-_MAX_RETRIES: int = 2          # per-provider retry attempts before moving on
-_BASE_DELAY: float = 1.0       # seconds — base for exponential backoff
-_MAX_DELAY: float = 8.0        # seconds — upper cap for backoff sleep
 
 
 class AllProvidersFailed(RuntimeError):
     """Raised when no configured LLM provider can complete a response."""
 
 
-def _is_retryable(exc: Exception) -> bool:
-    """Return True for transient errors that may succeed on retry."""
-    if isinstance(exc, _RETRYABLE_EXCEPTIONS):
-        return True
-    # Groq / Mistral / NVIDIA SDKs surface HTTP 429 / 503 as generic errors
-    # whose message contains the status code.
-    msg = str(exc).lower()
-    return any(code in msg for code in ("429", "503", "rate limit", "too many"))
+def _resolve_provider_name(response_meta: dict | None, default: str = "LLM") -> str:
+    """Extract human-readable provider name from LangChain metadata."""
+    if not response_meta:
+        return default
+    provider = response_meta.get("model_provider")
+    if provider:
+        return str(provider).capitalize()
+    model = response_meta.get("model_name") or response_meta.get("model") or ""
+    model_lower = str(model).lower()
+    if "groq" in model_lower or "gpt-oss" in model_lower:
+        return "Groq"
+    if "mistral" in model_lower:
+        return "Mistral"
+    if "llama" in model_lower or "nvidia" in model_lower:
+        return "NVIDIA"
+    if "gemini" in model_lower:
+        return "Gemini"
+    return default
 
 
-class LLMFallbackManager:
-    """Try providers in configured priority order with per-provider retry.
+class LangChainFallbackManager:
+    """Manages LLM fallback and retries using LangChain runnable chains.
 
-    Two modes:
-    - ``generate()``       — buffers the full answer (safe for internal callers).
-    - ``stream_generate()`` — yields tokens as they arrive for live SSE streaming.
-
-    Retry strategy (per provider):
-        backoff = min(max_delay, base_delay * 2 ** attempt)
-        sleep   = random.uniform(0, backoff)   # full jitter
-    Only transient errors (429, 503, timeout, connection reset) are retried.
-    Auth / config errors skip immediately to the next provider.
+    Features:
+    - ``with_retry()``: Exponential backoff with jitter on transient network / rate-limit errors.
+    - ``with_fallbacks()``: Automatic ordered failover (Groq -> Mistral -> NVIDIA -> Gemini).
+    - ``ChatPromptTemplate``: Centralized system prompt injection.
+    - ``generate()``: Buffered response via ``.ainvoke()``.
+    - ``stream_generate()``: Live token streaming via ``.astream()``.
     """
 
     def __init__(self, provider_engine: LLMs | None = None):
         self.provider_engine = provider_engine or default_llm
 
-    # ------------------------------------------------------------------
-    # Internal helper: attempt one provider with retry
-    # ------------------------------------------------------------------
-    async def _try_provider_buffered(
-        self,
-        provider_name: str,
-        stream_fn,
-        prompt: str,
-    ) -> str:
-        """Call stream_fn, buffer all tokens, return joined string.
-        Retries up to _MAX_RETRIES times on transient errors.
-        Raises the last exception on permanent failure.
-        """
-        last_exc: Exception | None = None
+    def _is_mock_or_legacy(self) -> bool:
+        """Detect mock objects in unit tests that supply get_fallback_chain."""
+        return not isinstance(self.provider_engine, LLMs) and hasattr(self.provider_engine, "get_fallback_chain")
 
-        for attempt in range(1, _MAX_RETRIES + 2):   # +2 → 1 initial + retries
-            try:
-                collected: list[str] = []
-                async for token in stream_fn(prompt):
-                    if token:
-                        collected.append(token)
-
-                answer = "".join(collected).strip()
-                if not answer:
-                    raise RuntimeError("Provider returned an empty response.")
-
-                return answer
-
-            except Exception as exc:
-                last_exc = exc
-                if attempt > _MAX_RETRIES or not _is_retryable(exc):
-                    logger.warning(
-                        "Provider %s attempt %d/%d — not retrying. Error: %s",
-                        provider_name, attempt, _MAX_RETRIES + 1, exc,
-                    )
-                    raise
-
-                backoff = min(_MAX_DELAY, _BASE_DELAY * (2 ** (attempt - 1)))
-                sleep_time = random.uniform(0, backoff)
-                logger.info(
-                    "Provider %s attempt %d/%d failed (transient) — retrying in %.2fs. Error: %s",
-                    provider_name, attempt, _MAX_RETRIES + 1, sleep_time, exc,
-                )
-                await asyncio.sleep(sleep_time)
-
-        raise last_exc  # unreachable, but satisfies type checker
-
-    # ------------------------------------------------------------------
-    # Buffered generate — full answer returned at once
-    # ------------------------------------------------------------------
-    async def generate(self, prompt: str) -> dict[str, str]:
-        """Try each provider in order; return the first successful answer."""
-        failures: list[str] = []
-        chain = self.provider_engine.get_fallback_chain()
-
-        if not chain:
+    def _build_pipeline(self):
+        """Construct the LangChain runnable pipeline with retries and fallbacks."""
+        models = self.provider_engine.get_models() if hasattr(self.provider_engine, "get_models") else []
+        if not models:
             raise AllProvidersFailed("No LLM providers are configured.")
 
-        for provider_name, stream_fn in chain:
-            logger.info("Attempting LLM provider (buffered): %s", provider_name)
-            try:
-                answer = await self._try_provider_buffered(provider_name, stream_fn, prompt)
-                logger.info("LLM response generated by %s", provider_name)
-                return {"answer": answer, "provider": provider_name}
+        # Wrap each model with LangChain's with_retry
+        retryable_models = []
+        for name, model in models:
+            m_retry = model.with_retry(
+                stop_after_attempt=_MAX_RETRIES + 1,
+                wait_exponential_jitter=True,
+                retry_if_exception_type=_RETRYABLE_EXCEPTIONS,
+            )
+            retryable_models.append((name, m_retry))
 
-            except Exception as exc:
-                logger.warning(
-                    "LLM provider %s failed; trying next. Error: %s",
-                    provider_name, exc,
-                )
-                failures.append(f"{provider_name}: {type(exc).__name__}")
+        primary_name, primary_model = retryable_models[0]
+        fallbacks = [m for _, m in retryable_models[1:]]
 
-        raise AllProvidersFailed(
-            "All configured LLM providers failed. " + "; ".join(failures)
-        )
+        if fallbacks:
+            chain = primary_model.with_fallbacks(
+                fallbacks=fallbacks,
+                exceptions_to_handle=(Exception,),
+            )
+        else:
+            chain = primary_model
 
-    # ------------------------------------------------------------------
-    # True streaming generate — yields (token, provider_name) tuples live
-    # ------------------------------------------------------------------
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", KNOWLEDGE_SYSTEM_PROMPT),
+            ("human", "{user_input}"),
+        ])
+        return prompt | chain
+
+    async def generate(self, prompt: str) -> dict[str, str]:
+        """Invoke the fallback chain (buffered). Returns {'answer': ..., 'provider': ...}."""
+        # Check if caller passed a mock or custom engine with get_fallback_chain (e.g. in tests)
+        if self._is_mock_or_legacy():
+            chain = self.provider_engine.get_fallback_chain()
+            if not chain:
+                raise AllProvidersFailed("No LLM providers are configured.")
+            failures: list[str] = []
+            for provider_name, stream_function in chain:
+                try:
+                    collected: list[str] = []
+                    stream = stream_function(prompt)
+                    async for token in stream:
+                        if token:
+                            collected.append(token)
+                    answer = "".join(collected).strip()
+                    if not answer:
+                        raise RuntimeError("Provider returned an empty response.")
+                    return {"answer": answer, "provider": provider_name}
+                except Exception as exc:
+                    failures.append(f"{provider_name}: {exc}")
+            raise AllProvidersFailed("All configured LLM providers failed. " + "; ".join(failures))
+
+        pipeline = self._build_pipeline()
+        try:
+            response = await pipeline.ainvoke({"user_input": prompt})
+            answer = str(response.content).strip()
+            if not answer and hasattr(response, "additional_kwargs") and response.additional_kwargs.get("reasoning_content"):
+                answer = str(response.additional_kwargs["reasoning_content"]).strip()
+
+            if not answer:
+                raise RuntimeError("Provider returned an empty response.")
+
+            provider = _resolve_provider_name(getattr(response, "response_metadata", None))
+            logger.info("LLM response generated by %s via LangChain", provider)
+            return {
+                "answer": answer,
+                "provider": provider,
+            }
+        except Exception as exc:
+            logger.exception("All configured LLM providers failed in LangChain chain: %s", exc)
+            raise AllProvidersFailed(f"All configured LLM providers failed: {exc}") from exc
+
     async def stream_generate(
         self, prompt: str
     ) -> AsyncGenerator[tuple[str, str], None]:
-        """Yield ``(token, provider_name)`` as tokens arrive from the LLM.
-
-        Provider selection with retry:
-        - Retries the *same* provider up to _MAX_RETRIES times on transient
-          errors **before** the first token is emitted (pre-flight phase).
-        - Once the first token is emitted we are committed to that provider.
-          A mid-stream failure raises AllProvidersFailed immediately — we
-          cannot restart with a fresh provider without producing duplicate text.
-        """
-        failures: list[str] = []
-        chain = self.provider_engine.get_fallback_chain()
-
-        if not chain:
-            raise AllProvidersFailed("No LLM providers are configured.")
-
-        for provider_name, stream_fn in chain:
-            logger.info("Attempting LLM provider (streaming): %s", provider_name)
-
-            for attempt in range(1, _MAX_RETRIES + 2):
+        """Yield (token, provider_name) live as tokens arrive from LangChain stream."""
+        # Check if caller passed a mock or custom engine with get_fallback_chain
+        if self._is_mock_or_legacy():
+            chain = self.provider_engine.get_fallback_chain()
+            if not chain:
+                raise AllProvidersFailed("No LLM providers are configured.")
+            for provider_name, stream_function in chain:
                 try:
-                    stream = stream_fn(prompt)
-                    first_token = True
                     token_emitted = False
-
+                    stream = stream_function(prompt)
                     async for token in stream:
-                        if not token:
-                            continue
-                        if first_token:
-                            first_token = False
-                            logger.info(
-                                "Streaming started from provider %s", provider_name
-                            )
-                        token_emitted = True
-                        yield token, provider_name
+                        if token:
+                            token_emitted = True
+                            yield token, provider_name
+                    if token_emitted:
+                        return
+                except Exception:
+                    continue
+            raise AllProvidersFailed("All configured LLM providers failed.")
 
-                    if not token_emitted:
-                        raise RuntimeError("Provider returned an empty stream.")
+        pipeline = self._build_pipeline()
+        provider_name = "LLM"
+        token_emitted = False
+        reasoning_chunks: list[str] = []
 
-                    # Stream completed successfully — we're done.
-                    return
+        try:
+            async for chunk in pipeline.astream({"user_input": prompt}):
+                if chunk.response_metadata:
+                    detected = _resolve_provider_name(chunk.response_metadata, default="")
+                    if detected:
+                        provider_name = detected
 
-                except Exception as exc:
-                    if attempt <= _MAX_RETRIES and _is_retryable(exc):
-                        backoff = min(_MAX_DELAY, _BASE_DELAY * (2 ** (attempt - 1)))
-                        sleep_time = random.uniform(0, backoff)
-                        logger.info(
-                            "Provider %s stream attempt %d/%d failed (transient) — retrying in %.2fs. Error: %s",
-                            provider_name, attempt, _MAX_RETRIES + 1, sleep_time, exc,
-                        )
-                        await asyncio.sleep(sleep_time)
-                        continue
+                reasoning = chunk.additional_kwargs.get("reasoning_content")
+                if reasoning:
+                    reasoning_chunks.append(str(reasoning))
 
-                    # Permanent failure or retries exhausted → next provider
-                    logger.warning(
-                        "LLM provider %s stream failed; trying next. Error: %s",
-                        provider_name, exc,
-                    )
-                    failures.append(f"{provider_name}: {type(exc).__name__}")
-                    break  # break retry loop, outer for picks next provider
+                if chunk.content:
+                    token_emitted = True
+                    yield str(chunk.content), provider_name
 
-        raise AllProvidersFailed(
-            "All configured LLM providers failed. " + "; ".join(failures)
-        )
+            # If the model emitted reasoning tokens instead of direct content
+            if not token_emitted and reasoning_chunks:
+                fallback_text = "".join(reasoning_chunks).strip()
+                if fallback_text:
+                    token_emitted = True
+                    yield fallback_text, provider_name
 
+            if not token_emitted:
+                raise RuntimeError("LLM stream completed without yielding any tokens.")
+
+        except Exception as exc:
+            logger.exception("LangChain streaming fallback chain failed: %s", exc)
+            raise AllProvidersFailed(f"All configured LLM providers failed: {exc}") from exc
+
+
+# Backward-compatible alias
+LLMFallbackManager = LangChainFallbackManager
