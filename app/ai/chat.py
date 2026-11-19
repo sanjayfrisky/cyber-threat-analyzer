@@ -78,8 +78,25 @@ class ChatService:
         """
         db = SessionLocal()
         try:
-            # --- 1. RAG retrieval ---
-            results = self.rag.retrieve(db, prompt, settings.top_k)
+            # --- 1. Router (LLM) ---
+            # Evaluates user prompt, optimizes RAG search query, and identifies candidate tools
+            search_query = prompt
+            candidate_tool_names: list[str] = []
+            try:
+                from app.ai.router.llm_router import default_router
+                decision = await default_router.route(prompt)
+                if decision.rewritten_rag_query:
+                    search_query = decision.rewritten_rag_query
+                candidate_tool_names = decision.candidate_tools
+                logger.info(
+                    "[chat] Router decision: intent=%s, query='%s', tools=%s",
+                    decision.intent, search_query[:60], candidate_tool_names
+                )
+            except Exception as router_err:
+                logger.warning("[chat] Router evaluation fallback: %s", router_err)
+
+            # --- 2. RAG retrieval ---
+            results = self.rag.retrieve(db, search_query, settings.top_k)
             sources = [
                 {
                     "citation": f"S{i}",
@@ -91,14 +108,57 @@ class ChatService:
                 for i, item in enumerate(results, 1)
             ]
 
-            # --- 2. Emit sources event ---
+            # --- 3. Tool evaluation & execution (if tools needed) ---
+            tool_evidence_snippets: list[str] = []
+            tools_used: list[str] = []
+
+            if candidate_tool_names:
+                try:
+                    from app.ai.agent.tool_registry import registry
+                    tool_objs = [registry.get_tool(n) for n in candidate_tool_names if registry.get_tool(n)]
+                    if tool_objs:
+                        # Quick check if specific CVE/KEV/command tool should be run
+                        for tobj in tool_objs:
+                            # Auto-execute specific high-value tools if parameters can be bound from prompt
+                            import re
+                            cve_m = re.search(r"\bCVE-\d{4}-\d{4,}\b", prompt, re.IGNORECASE)
+                            if tobj.name in ("cve_lookup", "kev_lookup") and cve_m:
+                                cve_id = cve_m.group(0).upper()
+                                t_res = tobj.invoke({"cve_id": cve_id})
+                                tools_used.append(tobj.name)
+                                if isinstance(t_res, dict):
+                                    tool_url = t_res.get("url")
+                                    if tool_url and not any(s.get("url") == tool_url for s in sources):
+                                        sources.append({
+                                            "citation": f"S{len(sources) + 1}",
+                                            "source": t_res.get("confirmed_source") or tobj.name,
+                                            "id": t_res.get("cve_id", cve_id),
+                                            "title": t_res.get("title", tobj.name),
+                                            "url": tool_url,
+                                        })
+                                    desc = t_res.get("description") or t_res.get("short_description") or ""
+                                    tool_evidence_snippets.append(
+                                        f"TOOL [{tobj.name} ({cve_id})]: {desc}"
+                                    )
+                            elif tobj.name == "analyze_command" and any(k in prompt.lower() for k in ("powershell", "cmd", "bash", "curl", "wget")):
+                                t_res = tobj.invoke({"command": prompt})
+                                tools_used.append(tobj.name)
+                                tool_evidence_snippets.append(
+                                    f"TOOL [{tobj.name}]: Risk Tier={t_res.get('risk_tier')}, Mitre={t_res.get('mitre_techniques')}"
+                                )
+                except Exception as tool_err:
+                    logger.debug("[chat] Tool calling evaluation bypassed: %s", tool_err)
+
+            # --- 4. Emit sources event ---
             yield (
-                f"data: {json.dumps({'type': 'sources', 'sources': sources, 'retrieved_count': len(results)})}\n\n"
+                f"data: {json.dumps({'type': 'sources', 'sources': sources, 'retrieved_count': len(sources)})}\n\n"
             )
 
+            extra_tool_context = ("\n\nTOOL VERIFICATION FINDINGS:\n" + "\n".join(tool_evidence_snippets)) if tool_evidence_snippets else ""
             grounded_prompt = (
                 f"USER QUESTION:\n{prompt}\n\n"
                 f"RETRIEVED EVIDENCE:\n{build_context(results)}"
+                f"{extra_tool_context}"
             )
 
             # --- 3. Stream tokens live ---
@@ -139,7 +199,7 @@ class ChatService:
 
             # --- 5. Done event ---
             yield (
-                f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'provider': provider_name})}\n\n"
+                f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'provider': provider_name, 'tools_used': tools_used})}\n\n"
             )
 
         except Exception:

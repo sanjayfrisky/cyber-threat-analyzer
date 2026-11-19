@@ -10,6 +10,7 @@ from app.db.database import init_db, SessionLocal
 from app.routes.chat import router
 from app.routes.screening import router as screening_router
 from app.routes.agent import router as agent_router
+from app.routes.tools import router as tools_router
 from app.ai.rag.ingestion import scrape_and_ingest_all
 
 logger = logging.getLogger(__name__)
@@ -76,13 +77,14 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origin_list,   # explicit whitelist, no wildcards
+    allow_origins=[settings.cors_origin_list, "http://localhost:3000"],  # explicit whitelist, no wildcards
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],   # only methods the frontend needs
+    allow_methods=["*"],   # only methods the frontend needs
     allow_headers=["Content-Type", "Authorization", "X-Session-Id"],
-)
+) 
 
 
 app.include_router(router, prefix="/api")
 app.include_router(screening_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
+app.include_router(tools_router, prefix="/api")
