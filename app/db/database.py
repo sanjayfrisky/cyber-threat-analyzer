@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import create_engine, String, Text, DateTime, Integer, JSON, ForeignKey, Index, text
+from sqlalchemy import create_engine, String, Text, DateTime, Integer, JSON, ForeignKey, Index, text, Boolean
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from pgvector.sqlalchemy import Vector
 from app.core.config import settings
@@ -56,7 +56,18 @@ class IncidentReport(Base):
     analysis: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-engine = create_engine(settings.database_url, pool_pre_ping=True, connect_args={"connect_timeout": 3})
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    full_name: Mapped[str] = mapped_column(String(255))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    salt: Mapped[str] = mapped_column(String(64))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+engine = create_engine(settings.database_url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 def init_db():
