@@ -114,8 +114,9 @@ class ChatService:
 
             if candidate_tool_names:
                 try:
-                    from app.ai.agent.tool_registry import registry
-                    tool_objs = [registry.get_tool(n) for n in candidate_tool_names if registry.get_tool(n)]
+                    from app.ai.tools import ALL_TOOLS
+                    tool_map = {t.name: t for t in ALL_TOOLS}
+                    tool_objs = [tool_map[n] for n in candidate_tool_names if n in tool_map]
                     if tool_objs:
                         # Quick check if specific CVE/KEV/command tool should be run
                         for tobj in tool_objs:
