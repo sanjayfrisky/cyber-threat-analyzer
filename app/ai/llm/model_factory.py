@@ -120,3 +120,55 @@ def build_model_with_retry_and_fallback(
         [name for name, _ in retryable[1:]],
     )
     return chain
+
+
+def build_bound_model_with_retry_and_fallback(
+    tools: list[Any],
+    configs: list[ProviderConfig] | None = None,
+) -> BaseChatModel:
+    """
+    Builds and binds tools to each configured provider model individually,
+    then chains them with retry resilience and provider fallback.
+
+    Binding tools directly to each underlying ChatModel (e.g. ChatGroq, ChatMistralAI)
+    before wrapping with .with_retry().with_fallbacks() ensures provider-level tool calling
+    contracts (like Groq's tool_choice requirement) are properly satisfied.
+    """
+    models = build_models_from_config(configs)
+    if not models:
+        raise RuntimeError(
+            "No LLM providers are configured. "
+            "Set at least one API key (GROQ_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY)."
+        )
+
+    bound_models: list[tuple[str, Any]] = []
+    for name, m in models:
+        if hasattr(m, "bind_tools"):
+            try:
+                bound_models.append((name, m.bind_tools(tools)))
+            except Exception as exc:
+                logger.warning("Failed to bind tools to provider %s: %s", name, exc)
+                bound_models.append((name, m))
+        else:
+            bound_models.append((name, m))
+
+    retry_kwargs = build_retry_kwargs()
+    retryable = [(name, m.with_retry(**retry_kwargs)) for name, m in bound_models]
+    primary_name, primary = retryable[0]
+    fallbacks = [m for _, m in retryable[1:]]
+
+    if fallbacks:
+        chain = primary.with_fallbacks(
+            fallbacks=fallbacks,
+            exceptions_to_handle=(Exception,),
+        )
+    else:
+        chain = primary
+
+    logger.info(
+        "Agent tool-bound LLM chain: primary=%s, fallbacks=%s, tools=%d",
+        primary_name,
+        [name for name, _ in retryable[1:]],
+        len(tools),
+    )
+    return chain

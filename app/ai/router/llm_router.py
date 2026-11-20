@@ -157,7 +157,7 @@ class LLMRouter:
             return RoutingDecision(
                 destination="tool",
                 selected_tool="mitre_lookup",
-                tool_args={"technique_id_or_query": mitre_id},
+                tool_args={"technique_id": mitre_id},
                 intent="mitre_analysis",
                 candidate_tools=["mitre_lookup"],
                 reasoning=f"Heuristic routed to mitre_lookup for technique {mitre_id}",

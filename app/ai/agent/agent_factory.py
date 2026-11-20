@@ -10,7 +10,11 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.tools import BaseTool
 
 from app.ai.agent.tool_registry import ToolRegistry, registry as default_registry
-from app.ai.llm.model_factory import build_model_with_retry_and_fallback, build_models_from_config
+from app.ai.llm.model_factory import (
+    build_bound_model_with_retry_and_fallback,
+    build_model_with_retry_and_fallback,
+    build_models_from_config,
+)
 from app.ai.prompts.cybersecurity_agent import CYBERSECURITY_AGENT_SYSTEM_PROMPT
 from app.core.config import settings
 
@@ -36,7 +40,20 @@ class SafeCyberAgent:
         self.max_iterations = max_iterations or getattr(settings, "agent_max_iterations", 10)
         self.max_tool_calls = max_tool_calls or getattr(settings, "agent_max_tool_calls", 15)
         self.system_prompt = system_prompt
-        self.llm = llm or build_model_with_retry_and_fallback()
+
+        if llm is not None:
+            self.plain_llm = llm
+            try:
+                self.model_with_tools = llm.bind_tools(self.tools) if hasattr(llm, "bind_tools") else llm
+            except Exception:
+                self.model_with_tools = llm
+        else:
+            self.plain_llm = build_model_with_retry_and_fallback()
+            self.model_with_tools = (
+                build_bound_model_with_retry_and_fallback(self.tools)
+                if self.tools
+                else self.plain_llm
+            )
 
     async def run(self, user_query: str) -> dict[str, Any]:
         """
@@ -59,17 +76,13 @@ class SafeCyberAgent:
         tool_results: list[dict[str, Any]] = []
         total_tool_calls = 0
 
-        # Bind tools to the model
-        model_with_tools = self.llm.bind_tools(self.tools) if hasattr(self.llm, "bind_tools") else self.llm
-
         for iteration in range(1, self.max_iterations + 1):
             logger.info("[agent] iteration %d/%d", iteration, self.max_iterations)
             try:
-                ai_message: AIMessage = await model_with_tools.ainvoke(messages)
+                ai_message: AIMessage = await self.model_with_tools.ainvoke(messages)
             except Exception as exc:
-                logger.error("[agent] LLM invocation failed on iteration %d: %s", iteration, exc)
-                # Fallback to direct model invocation if tool binding failed
-                ai_message = await self.llm.ainvoke(messages)
+                logger.warning("[agent] tool-bound LLM failed on iteration %d: %s, falling back to direct LLM", iteration, exc)
+                ai_message = await self.plain_llm.ainvoke(messages)
 
             messages.append(ai_message)
 

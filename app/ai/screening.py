@@ -32,7 +32,8 @@ SUSPICIOUS_COMMAND_PATTERNS = [
     (r"\b(?:cmd(?:\.exe)?\s+/c|bash\s+-c|sh\s+-c)\b", "Command-Line Shell Invocation", "T1059"),
     (r"\b(?:curl|wget)\b[^\n|]+?\|\s*(?:bash|sh)\b", "Remote Script Download and Execution", "T1059.004"),
     (r"\b(?:mimikatz|sekurlsa|kerbrute|responder)\b", "Credential Access Tooling", "T1003"),
-    (r"\b(?:vssadmin\s+delete\s+shadows|wbadmin\s+delete\s+catalog)\b", "Ransomware Inhibit System Recovery", "T1490"),
+    (r"\b(?:vssadmin\s+delete\s+shadows|wbadmin\s+delete\s+catalog)\b", "Ransomware Inhibit System Recovery (Shadow Copy Deletion)", "T1490"),
+    (r"\bbcdedit\b.*?\brecoveryenabled\b", "Boot Recovery Disabled (Ransomware Persistence)", "T1490"),
     (r"\b(?:net\s+user\s+/add|net\s+localgroup\s+administrators\s+/add)\b", "Local Account Creation", "T1136.001"),
     (r"\b(?:certutil(?:\.exe)?\s+-urlcache|-decode)\b", "Certutil Download or Decode Evasion", "T1140"),
     (r"\b(?:SELECT\s+.*?\s+FROM\s+.*?\s+WHERE\s+.*?--|\bUNION\s+SELECT\b)", "SQL Injection Attempt", "T1190"),
@@ -171,16 +172,47 @@ class ScreeningService:
             for i, r in enumerate(retrieved_intel, 1)
         ]
 
+        # --- Minimum-verdict enforcement ---
+        # Heuristics are deterministic rule-based signals; the AI must NOT downgrade them.
+        # If heuristics fired (known-bad patterns matched), clamp the verdict upward.
+        VERDICT_RANK = {"BENIGN": 0, "INCONCLUSIVE": 1, "SUSPICIOUS": 2, "MALICIOUS": 3}
+        ai_verdict = ai_result.get("verdict", "INCONCLUSIVE")
+        heuristic_verdict = "BENIGN"
+        if heuristics["prompt_injection_detected"]:
+            heuristic_verdict = "MALICIOUS"
+        elif heuristics["mitre_techniques"]:
+            heuristic_verdict = "SUSPICIOUS"
+
+        # Clamp: take the higher-severity verdict between AI and heuristics
+        final_verdict = ai_verdict if VERDICT_RANK.get(ai_verdict, 1) >= VERDICT_RANK.get(heuristic_verdict, 0) else heuristic_verdict
+
+        # Adjust risk_score and action to stay consistent with the clamped verdict
+        ai_risk = ai_result.get("risk_score", 0)
+        if final_verdict == "MALICIOUS" and ai_risk < 70:
+            ai_risk = max(ai_risk, 75)
+        elif final_verdict == "SUSPICIOUS" and ai_risk < 40:
+            ai_risk = max(ai_risk, 50)
+
+        final_action = ai_result.get("recommended_action", "QUARANTINE")
+        if final_verdict == "MALICIOUS" and final_action not in ("BLOCK", "QUARANTINE"):
+            final_action = "BLOCK"
+        elif final_verdict == "SUSPICIOUS" and final_action == "PASS":
+            final_action = "QUARANTINE"
+
+        # Merge heuristic findings into AI findings so they are always visible
+        ai_findings = ai_result.get("findings", []) or []
+        merged_findings = list(dict.fromkeys(ai_findings + heuristics["findings"]))  # deduplicate, preserve order
+
         return {
-            "verdict": ai_result.get("verdict", "INCONCLUSIVE"),
-            "risk_score": ai_result.get("risk_score", 0),
+            "verdict": final_verdict,
+            "risk_score": ai_risk,
             "confidence": ai_result.get("confidence", 0.5),
             "threat_category": ai_result.get("threat_category", "Unknown"),
             "prompt_injection_detected": ai_result.get("prompt_injection_detected", heuristics["prompt_injection_detected"]),
             "mitre_techniques": sorted(list(set(ai_result.get("mitre_techniques", []) + heuristics["mitre_techniques"]))),
             "summary": ai_result.get("summary", ""),
-            "findings": ai_result.get("findings", heuristics["findings"]),
-            "recommended_action": ai_result.get("recommended_action", "QUARANTINE"),
+            "findings": merged_findings,
+            "recommended_action": final_action,
             "iocs": iocs,
             "sources": sources
         }
