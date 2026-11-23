@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     mistral_model: str = "mistral-small-latest"
     nvidia_model: str = "meta/llama-3.1-8b-instruct"
 
+    # Google OAuth credentials
+    google_client_id: str | None = None
+    google_client_secret: str | None = None
+
     # LLM generation settings (used by model_factory and agent layer)
     llm_temperature: float = 0.2
     llm_max_tokens: int = 4096

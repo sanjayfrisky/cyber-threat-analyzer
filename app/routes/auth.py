@@ -14,6 +14,7 @@ from app.core.auth import (
     create_access_token,
     get_current_user,
     hash_password,
+    verify_google_id_token,
     verify_password,
     TOKEN_EXPIRY_HOURS,
     TOKEN_EXPIRY_REMEMBER_DAYS,
@@ -39,10 +40,17 @@ class LoginRequest(BaseModel):
     remember_me: bool = Field(default=False, description="Persist session for 30 days")
 
 
+class GoogleAuthRequest(BaseModel):
+    id_token: str = Field(..., description="Google ID Token (JWT) from Google Identity Services")
+    remember_me: bool = Field(default=True, description="Persist session for 30 days")
+
+
 class UserResponse(BaseModel):
     id: int
     email: str
     full_name: str
+    avatar_url: str | None = None
+    auth_provider: str = "local"
 
 
 class AuthResponse(BaseModel):
@@ -109,7 +117,13 @@ def register_user(
 
     logger.info("New user registered: %s (id=%d)", user.email, user.id)
     return AuthResponse(
-        user=UserResponse(id=user.id, email=user.email, full_name=user.full_name),
+        user=UserResponse(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            avatar_url=user.avatar_url,
+            auth_provider=user.auth_provider,
+        ),
         token=token,
         message="Account registered successfully.",
     )
@@ -148,9 +162,93 @@ def login_user(
 
     logger.info("User logged in: %s (id=%d, remember=%s)", user.email, user.id, payload.remember_me)
     return AuthResponse(
-        user=UserResponse(id=user.id, email=user.email, full_name=user.full_name),
+        user=UserResponse(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            avatar_url=user.avatar_url,
+            auth_provider=user.auth_provider,
+        ),
         token=token,
         message="Login successful.",
+    )
+
+
+@router.post("/google", response_model=AuthResponse)
+def google_auth(
+    payload: GoogleAuthRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> AuthResponse:
+    """Authenticate or register a security analyst using a Google ID token."""
+    try:
+        google_info = verify_google_id_token(payload.id_token)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    email = google_info["email"].strip().lower()
+    full_name = google_info.get("full_name") or email.split("@")[0]
+    provider_id = google_info.get("sub")
+    avatar_url = google_info.get("avatar_url")
+
+    # Check if user already exists
+    user = db.scalar(select(User).where(User.email == email))
+
+    if user:
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is suspended or deactivated.",
+            )
+        # Link Google OAuth details if previously local or update avatar
+        if not user.provider_id:
+            user.provider_id = provider_id
+        if avatar_url and not user.avatar_url:
+            user.avatar_url = avatar_url
+        if user.auth_provider == "local" and not user.password_hash:
+            user.auth_provider = "google"
+        db.commit()
+        db.refresh(user)
+        logger.info("Analyst authenticated via Google: %s (id=%d)", user.email, user.id)
+    else:
+        # Create new analyst account provisioned via Google
+        user = User(
+            email=email,
+            full_name=full_name,
+            password_hash=None,
+            salt=None,
+            auth_provider="google",
+            provider_id=provider_id,
+            avatar_url=avatar_url,
+            is_active=True,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        logger.info("New analyst account registered via Google: %s (id=%d)", user.email, user.id)
+
+    token = create_access_token(
+        user_id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        remember_me=payload.remember_me,
+    )
+    _set_auth_cookie(response, token, remember_me=payload.remember_me)
+
+    return AuthResponse(
+        user=UserResponse(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            avatar_url=user.avatar_url,
+            auth_provider=user.auth_provider,
+        ),
+        token=token,
+        message="Google sign-in successful.",
     )
 
 
@@ -163,6 +261,8 @@ def get_current_user_profile(
         id=current_user.id,
         email=current_user.email,
         full_name=current_user.full_name,
+        avatar_url=current_user.avatar_url,
+        auth_provider=current_user.auth_provider,
     )
 
 

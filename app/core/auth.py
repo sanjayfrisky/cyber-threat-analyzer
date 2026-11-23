@@ -40,8 +40,10 @@ def hash_password(password: str) -> tuple[str, str]:
     return key.hex(), salt
 
 
-def verify_password(password: str, password_hash: str, salt: str) -> bool:
+def verify_password(password: str, password_hash: str | None, salt: str | None) -> bool:
     """Verify password against stored hash using constant-time comparison."""
+    if not password_hash or not salt:
+        return False
     key = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
@@ -49,6 +51,43 @@ def verify_password(password: str, password_hash: str, salt: str) -> bool:
         iterations=100_000,
     )
     return hmac.compare_digest(key.hex(), password_hash)
+
+
+def verify_google_id_token(id_token_str: str) -> dict[str, Any]:
+    """
+    Verify a Google ID Token (JWT) issued by Google Identity Services.
+    Validates token signature against Google certs, expiration, and issuer.
+    Returns verified payload dict containing sub, email, full_name, avatar_url.
+    """
+    try:
+        from google.oauth2 import id_token
+        from google.auth.transport import requests as google_requests
+
+        request = google_requests.Request()
+        client_id = settings.google_client_id if settings.google_client_id else None
+
+        # verify_oauth2_token verifies signature, expiration, and audience (if client_id is set)
+        id_info = id_token.verify_oauth2_token(id_token_str, request, audience=client_id)
+
+        # Confirm valid Google issuer
+        issuer = id_info.get("iss", "")
+        if issuer not in ["accounts.google.com", "https://accounts.google.com"]:
+            raise ValueError(f"Untrusted token issuer: {issuer}")
+
+        email = id_info.get("email")
+        if not email:
+            raise ValueError("Google token does not contain an email address.")
+
+        return {
+            "sub": id_info.get("sub"),
+            "email": email,
+            "full_name": id_info.get("name") or email.split("@")[0],
+            "avatar_url": id_info.get("picture"),
+            "email_verified": id_info.get("email_verified", True),
+        }
+    except Exception as exc:
+        logger.warning("Google ID token validation failed: %s", exc)
+        raise ValueError(f"Google token validation failed: {str(exc)}") from exc
 
 
 def _b64url_encode(data: bytes) -> str:

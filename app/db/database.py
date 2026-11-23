@@ -62,10 +62,14 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     full_name: Mapped[str] = mapped_column(String(255))
-    password_hash: Mapped[str] = mapped_column(String(255))
-    salt: Mapped[str] = mapped_column(String(64))
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    salt: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    auth_provider: Mapped[str] = mapped_column(String(50), default="local")
+    provider_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
 
 engine = create_engine(settings.database_url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -73,6 +77,21 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 def init_db():
     with engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+
+        # Ensure users table has OAuth support columns
+        users_table_check = conn.execute(text("""
+            SELECT 1 FROM information_schema.tables WHERE table_name = 'users'
+        """)).fetchone()
+        if users_table_check:
+            try:
+                conn.execute(text("ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL"))
+                conn.execute(text("ALTER TABLE users ALTER COLUMN salt DROP NOT NULL"))
+                conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(50) DEFAULT 'local'"))
+                conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS provider_id VARCHAR(255)"))
+                conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT"))
+            except Exception:
+                pass
+
         # Check if legacy document_chunks table exists without the required 'source' column
         col_check = conn.execute(text("""
             SELECT column_name 
