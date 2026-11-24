@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     google_client_id: str | None = None
     google_client_secret: str | None = None
 
+    # External Plugin OAuth credentials
+    github_client_id: str | None = None
+    github_client_secret: str | None = None
+    slack_client_id: str | None = None
+    slack_client_secret: str | None = None
+
     # LLM generation settings (used by model_factory and agent layer)
     llm_temperature: float = 0.2
     llm_max_tokens: int = 4096

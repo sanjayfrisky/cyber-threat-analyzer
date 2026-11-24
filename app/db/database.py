@@ -69,6 +69,40 @@ class User(Base):
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    integrations: Mapped[list["UserIntegration"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class UserIntegration(Base):
+    __tablename__ = "user_integrations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(50), index=True)  # github, gmail, google_drive, slack
+    is_connected: Mapped[bool] = mapped_column(Boolean, default=True)
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    encrypted_access_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    encrypted_refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    account_info: Mapped[dict] = mapped_column(JSON, default=dict)  # email, user/team name, avatar
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    user: Mapped["User"] = relationship(back_populates="integrations")
+    __table_args__ = (Index("ix_user_provider", "user_id", "provider", unique=True),)
+
+
+class IntegrationAuditLog(Base):
+    __tablename__ = "integration_audit_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(50), index=True)
+    tool_name: Mapped[str] = mapped_column(String(100), index=True)
+    action: Mapped[str] = mapped_column(String(100))  # read, write, send, create_pr, etc.
+    parameters_sanitized: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20))  # success, error, rejected
+    user_approved: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
 
 
 engine = create_engine(settings.database_url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
